@@ -4,7 +4,24 @@ version = "0.1.0"
 description = "Missing citation detection system for scientific papers"
 requires-python = ">=3.13"
 dependencies = [
-
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.20",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "qdrant-client>=1.13",
+    "asyncpg>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "pyyaml>=6",
+    "jinja2>=3",
+    "httpx>=0.28",
+    "structlog>=24",
+    "rapidfuzz>=3",
+    "cachetools>=5",
+    "marker-pdf>=1.0",
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "pytest-httpx>=0.35",
 ]
 
 [tool.pytest.ini_options]

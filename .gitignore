@@ -13,3 +13,7 @@ pdf
 in_pdfs
 out_pdf
 out_md
+
+# Environment & cache
+.env
+.cache/

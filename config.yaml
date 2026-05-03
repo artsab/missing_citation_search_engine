@@ -1,0 +1,26 @@
+llm:
+  model: gpt-4o-mini
+  temperature: 0.0
+  max_tokens: 2048
+
+embedding:
+  model: text-embedding-3-small
+  dimension: 1536
+
+rerank:
+  model: gpt-4o-mini
+
+pipeline:
+  max_claims: 20
+  top_k_retrieval: 100
+  top_k_rerank: 20
+  top_k_output: 10
+  confidence_threshold: 0.6
+
+chunking:
+  paragraph_size: 500
+  paragraph_overlap: 100
+
+logging:
+  level: INFO
+  format: json   # json | text
