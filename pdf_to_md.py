@@ -95,8 +95,9 @@ def process_folder(input_dir: str, output_dir: str) -> list:
     
     results = []
     for filename in os.listdir(input_dir):
-        if filename.lower().endswith('.pdf'):
+        if filename.lower().endswith('.pdf') and not filename.lower().endswith('en.pdf'):
             pdf_path = os.path.join(input_dir, filename)
+            print(f"Proccessing file {filename}")
             md_path = pdf_to_md(pdf_path, output_dir)
             results.append(md_path)
     
@@ -104,7 +105,7 @@ def process_folder(input_dir: str, output_dir: str) -> list:
 
 
 if __name__ == '__main__':
-    input_folder = 'in_pdfs'
+    input_folder = 'pdf'
     output_folder = 'out_md'
     
     converted_files = process_folder(input_folder, output_folder)
