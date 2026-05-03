@@ -30,7 +30,7 @@ POST /analyze (PDF multipart)
    5. Filtering             (удаление уже процитированных)
         │
         ▼
-   6. Re-ranking            (Cross-Encoder: DiTy/cross-encoder-russian-msmarco)
+   6. Re-ranking            (LLM-based rerank через внешний API)
         │
         ▼
    7. LLM Judge             (should_cite + confidence + reason)
@@ -53,8 +53,8 @@ POST /analyze (PDF multipart)
 | PDF → Markdown | `marker` (лучший для научных статей, структурный вывод) |
 | Векторная БД | Qdrant |
 | Метаданные | PostgreSQL |
-| Эмбеддинги | `intfloat/multilingual-e5-large-instruct` |
-| Cross-encoder | `DiTy/cross-encoder-russian-msmarco` |
+| Эмбеддинги | Внешний API (через `EmbeddingClient`, OpenAI-совместимый) |
+| Cross-encoder / Rerank | Внешний API (LLM-based rerank через `LLMClient`) |
 | LLM | OpenAI-совместимый API (единый `LLMClient`) |
 | Конфигурация | `.env` (секреты) + `config.yaml` (параметры) |
 | Инфраструктура | Docker Compose (api + qdrant + postgres) |
@@ -75,7 +75,7 @@ POST /analyze (PDF multipart)
 4. Разбиение на чанки (два уровня):
    - **Section-level**: abstract целиком, каждая секция отдельно
    - **Paragraph-level**: 400–800 токенов, overlap 100
-5. Эмбеддинг каждого чанка через `multilingual-e5-large-instruct`
+5. Эмбеддинг каждого чанка через внешний Embedding API (OpenAI-совместимый)
 6. Сохранение векторов в Qdrant (одна коллекция, поле `chunk_type: section | paragraph`)
 7. Сохранение метаданных в PostgreSQL (таблица `papers`)
 
@@ -97,7 +97,7 @@ POST /analyze (PDF multipart)
 
 **Qdrant коллекция:**
 - Название: `papers`
-- Размерность вектора: 1024 (для multilingual-e5-large-instruct)
+- Размерность вектора: определяется моделью внешнего провайдера (см. config)
 - Distance: Cosine
 
 ### 4.2 PDF → Markdown (входная статья)
@@ -123,7 +123,7 @@ POST /analyze (PDF multipart)
 ### 4.5 Retrieval
 
 Для каждого claim:
-1. Embedding claim через `multilingual-e5-large-instruct` (с инструкцией: `"query: find papers supporting the claim: {text}"`)
+1. Embedding claim через внешний Embedding API (с инструкцией в тексте запроса)
 2. Поиск в Qdrant:
    - Сначала section-level (топ-50)
    - Затем paragraph-level (топ-50)
@@ -136,10 +136,10 @@ POST /analyze (PDF multipart)
 1. Точное совпадение по DOI
 2. Fuzzy-сопоставление по названию (через `rapidfuzz`)
 
-### 4.7 Re-ranking (Cross-Encoder)
+### 4.7 Re-ranking (LLM-based)
 
-- Модель: `DiTy/cross-encoder-russian-msmarco`
-- Для каждой пары `(claim, candidate_paper.abstract)` — посчитать релевантность
+- Ранжирование через LLM: для каждой пары `(claim, candidate_paper.abstract)` отправляется запрос к LLM с промптом `rerank.j2`
+- LLM оценивает релевантность claim'а к abstract кандидата (score 0–1)
 - Оставить top-20 кандидатов
 
 ### 4.8 LLM Judge
@@ -260,6 +260,8 @@ class AnalyzeResponse(BaseModel):
 ```
 LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.openai.com/v1
+EMBEDDING_API_KEY=sk-...
+EMBEDDING_BASE_URL=https://api.openai.com/v1
 QDRANT_URL=http://qdrant:6333
 POSTGRES_DSN=postgresql://user:pass@postgres:5432/db
 ```
@@ -272,11 +274,10 @@ llm:
   max_tokens: 2048
 
 embedding:
-  model: intfloat/multilingual-e5-large-instruct
-  device: cpu
+  model: text-embedding-3-small
 
-cross_encoder:
-  model: DiTy/cross-encoder-russian-msmarco
+rerank:
+  model: gpt-4o-mini
 
 pipeline:
   max_claims: 20
@@ -325,6 +326,7 @@ Prompt-шаблоны в `app/prompts/` (Jinja2):
 - `reference_extraction.j2`
 - `judge.j2`
 - `explanation.j2`
+- `rerank.j2`
 
 ---
 
@@ -364,7 +366,7 @@ project/
 │   ├── ingestion/
 │   │   ├── parser.py            # marker wrapper (PDF → MD + metadata)
 │   │   ├── chunker.py           # Section-level + paragraph-level
-│   │   ├── embedder.py          # multilingual-e5-large-instruct + LRU кэш
+│   │   ├── embedder.py          # Внешний Embedding API + LRU кэш
 │   │   └── indexer.py           # Загрузка в Qdrant + PostgreSQL
 │   │
 │   ├── pipeline/
@@ -372,7 +374,7 @@ project/
 │   │   ├── reference_extractor.py # LLM, из md → structured refs
 │   │   ├── retriever.py         # Qdrant: section + paragraph
 │   │   ├── filter.py            # DOI exact + title fuzzy
-│   │   ├── reranker.py          # Cross-encoder
+│   │   ├── reranker.py          # LLM-based rerank
 │   │   ├── judge.py             # LLM should_cite оценка
 │   │   ├── explainer.py         # LLM развёрнутое объяснение
 │   │   └── orchestrator.py      # Сборка pipeline для /analyze
@@ -392,7 +394,8 @@ project/
 │   │   ├── claim_extraction.j2
 │   │   ├── reference_extraction.j2
 │   │   ├── judge.j2
-│   │   └── explanation.j2
+│   │   ├── explanation.j2
+│   │   └── rerank.j2
 │   │
 │   ├── utils/
 │   │   ├── text.py              # Text helpers
@@ -471,9 +474,6 @@ pydantic-settings
 qdrant-client
 asyncpg
 sqlalchemy[asyncio]
-sentence-transformers
-torch
-numpy
 pyyaml
 jinja2
 httpx
@@ -500,7 +500,7 @@ pytest-asyncio
 | 8 | Reference Extraction |
 | 9 | Retrieval (двухуровневый) |
 | 10 | Filter (dedup) |
-| 11 | Cross-encoder rerank |
+| 11 | LLM-based rerank |
 | 12 | LLM Judge |
 | 13 | LLM Explanation |
 | 14 | Orchestrator — сборка `POST /analyze` |

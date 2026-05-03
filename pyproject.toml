@@ -1,11 +1,18 @@
 [project]
 name = "new-geors-ai"
 version = "0.1.0"
-description = "Add your description here"
+description = "Missing citation detection system for scientific papers"
 requires-python = ">=3.13"
 dependencies = [
-    "pdfplumber>=0.11.9",
-    "pytest>=9.0.3",
-    "sentence-transformers>=5.4.1",
-    "torch>=2.11.0",
+
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "unit: tests without external dependencies",
+    "integration: tests requiring Docker services",
+    "llm: tests requiring real LLM API",
+    "e2e: full cycle end-to-end tests",
+    "slow: tests taking more than 10 seconds",
 ]

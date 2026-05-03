@@ -216,8 +216,8 @@ class TestMarkerParserIntegration:
    - Paragraph-level: 400–800 токенов, overlap 100
    - Каждый чанк: `{paper_id, title, chunk_text, section, chunk_type, year, doi, authors}`
 2. Реализовать `app/ingestion/embedder.py`:
-   - `encode(texts: list[str], instruction: str | None) -> np.ndarray`
-   - Модель `intfloat/multilingual-e5-large-instruct`
+   - `encode(texts: list[str], instruction: str | None) -> list[list[float]]`
+   - Вызов внешнего Embedding API (OpenAI-совместимый)
    - LRU-кэш эмбеддингов in-memory по `text → embedding`
 3. Реализовать `app/ingestion/indexer.py`:
    - `index_paper(doc: ParsedDocument)` — полный цикл: чанкинг → эмбеддинг → Qdrant + PostgreSQL
@@ -233,7 +233,7 @@ class TestMarkerParserIntegration:
 ### Критерии готовности
 - [ ] Чанкер создаёт ≥2 чанков на документ (section + paragraphs)
 - [ ] Paragraph-чанки не превышают 800 токенов
-- [ ] Эмбеддер возвращает вектор размерности 1024
+- [ ] Эмбеддер возвращает вектор размерности согласно модели провайдера
 - [ ] LRU-кэш корректно попадает в кэш при повторном запросе
 - [ ] Индексатор сохраняет строку в PostgreSQL и N векторов в Qdrant
 - [ ] Повторный запуск CLI не переиндексирует уже обработанные PDF (проверка по DOI)
@@ -277,19 +277,20 @@ class TestChunker:
 # tests/unit/test_stage3_embedder.py
 
 class TestEmbedder:
-    """Юнит-тесты эмбеддера (с моком sentence-transformers)"""
+    """Юнит-тесты эмбеддера (с моком внешнего Embedding API)"""
 
     def test_embed_returns_correct_shape(self, mock_model):
-        """5 текстов → (5, 1024)"""
+        """5 текстов → (5, D) где D — размерность модели провайдера"""
         embeddings = encode(["text1", "text2", "text3", "text4", "text5"])
-        assert embeddings.shape == (5, 1024)
+        assert len(embeddings) == 5
+        assert len(embeddings[0]) > 0
 
-    def test_embed_empty_list_returns_empty(self, mock_model):
+    def test_embed_empty_list_returns_empty(self, mock_embedding_client):
         """Пустой список → (0, 1024)"""
         ...
 
-    def test_embed_single_text(self, mock_model):
-        """Один текст → (1, 1024)"""
+    def test_embed_single_text(self, mock_embedding_client):
+        """Один текст → (1, D)"""
         ...
 
     def test_lru_cache_hit(self, embedder_with_cache):
@@ -372,6 +373,7 @@ class TestIngestBulkCLI:
    - `claim_extraction.j2`
    - `judge.j2`
    - `explanation.j2`
+   - `rerank.j2`
 4. Реализовать `app/logging_config.py` — structlog (JSON в prod, text в dev)
 5. Реализовать `app/utils/logging.py` — context manager для `request_id`
 6. Написать `tests/unit/fixtures/llm_responses.py` — JSON-фикстуры ответов LLM
@@ -437,6 +439,10 @@ class TestPrompts:
 
     def test_explanation_renders(self, jinja_env):
         """Шаблон explanation.j2 рендерится с reason"""
+        ...
+
+    def test_rerank_renders(self, jinja_env):
+        """Шаблон rerank.j2 рендерится с claim + abstract"""
         ...
 
 
@@ -673,13 +679,13 @@ class TestCitationsUtils:
 ## Этап 7: Re-ranking + LLM Judge + Explainer
 
 ### Цель
-Реализовать cross-encoder реранкинг, LLM-оценку необходимости цитирования и генерацию объяснений.
+Реализовать LLM-based реранкинг, LLM-оценку необходимости цитирования и генерацию объяснений.
 
 ### Задачи
 1. Реализовать `app/pipeline/reranker.py`:
    - `rerank(claims: list[Claim], candidates: list[Candidate]) -> list[Candidate]`
-   - Модель `DiTy/cross-encoder-russian-msmarco`
-   - Пары `(claim.text, candidate.abstract)` → score
+   - LLM-based rerank: для каждой пары `(claim.text, candidate.abstract)` — запрос к LLM с промптом `rerank.j2`
+   - LLM оценивает релевантность (score 0–1)
    - Оставить top-20
 2. Реализовать `app/pipeline/judge.py`:
    - `judge(claims: list[Claim], candidates: list[Candidate]) -> list[JudgeDecision]`
@@ -692,8 +698,8 @@ class TestCitationsUtils:
    - Добавление поля `reason` (2–4 предложения на русском)
 
 ### Критерии готовности
-- [ ] Ререйнкер возвращает ≤20 кандидатов
-- [ ] Cross-encoder отрабатывает без GPU (CPU, медленно — ок)
+- [ ] Реранкер возвращает ≤20 кандидатов
+- [ ] LLM-based rerank отрабатывает через внешний API
 - [ ] Judge возвращает `should_cite` + `confidence` + `reason` для каждого
 - [ ] Judge-фильтр оставляет только should_cite=True + confidence > 0.6
 - [ ] Explainer генерирует 2–4 предложения на русском
@@ -704,18 +710,18 @@ class TestCitationsUtils:
 # tests/unit/test_stage7_reranker.py
 
 class TestReranker:
-    """Юнит-тесты реранкера с моком cross-encoder"""
+    """Юнит-тесты реранкера с моком LLMClient"""
 
-    async def test_rerank_returns_top20(self, mock_cross_encoder, claims, candidates_100):
+    async def test_rerank_returns_top20(self, mock_llm, claims, candidates_100):
         """100 кандидатов → ≤20"""
         result = await rerank(claims, candidates_100)
         assert len(result) <= 20
 
-    async def test_rerank_sorts_by_score(self, mock_cross_encoder, claims, candidates):
+    async def test_rerank_sorts_by_score(self, mock_llm, claims, candidates):
         """Результат отсортирован по убыванию score"""
         ...
 
-    async def test_rerank_preserves_paper_id(self, mock_cross_encoder, claims, candidates):
+    async def test_rerank_preserves_paper_id(self, mock_llm, claims, candidates):
         """paper_id не теряется при реранкинге"""
         ...
 
@@ -965,11 +971,11 @@ async def qdrant_client():
 |------|----------------------|--------|---------------|
 | 1. Инфраструктура | 1–2 дня | 10+ | Не поднять Docker на CI |
 | 2. PDF-парсер | 1–2 дня | 8+ | marker не парсит конкретные PDF |
-| 3. Ingestion | 3–5 дней | 15+ | Эмбеддинг-модель требует много RAM на CPU |
+| 3. Ingestion | 3–5 дней | 15+ | Эмбеддинг-модель через внешний API: задержки и лимиты |
 | 4. LLM-инфра | 1–2 дня | 9+ | Формат ответа LLM нестабилен |
 | 5. Extraction | 2–3 дня | 9+ | LLM hallucinates references |
 | 6. Retrieval+Filter | 2–3 дня | 14+ | Qdrant-запросы медленные без оптимизации |
-| 7. Re-rank+Judge | 2–3 дня | 10+ | Cross-encoder на CPU очень медленный |
+| 7. Re-rank+Judge | 2–3 дня | 10+ | LLM-based rerank: много вызовов API на больших списках |
 | 8. Orchestrator | 2–3 дня | 11+ | Таймауты при долгой обработке |
 | 9. Тестирование | 2–4 дня | финальное покрытие | Моки нереалистичны |
 
@@ -980,7 +986,7 @@ async def qdrant_client():
 1. **Фикстуры LLM-ответов** хранить в `tests/unit/fixtures/llm_responses.py` — JSON-файлы с типовыми ответами для каждого промпта.
 2. **Моки Qdrant** делать через `unittest.mock.AsyncMock` — не мокать `__init__`, мокать методы `.search()`, `.upsert()`.
 3. **Моки PostgreSQL** — в юнит-тестах использовать `asyncpg` mock; в интеграционных — реальный контейнер.
-4. **Cross-encoder в тестах:** в юнит-тестах — мок; в интеграционных — загружать модель один раз на сессию (`scope="session"`).
+4. **LLM-based rerank в тестах:** в юнит-тестах — мок `LLMClient`; в интеграционных — реальный LLM.
 5. **E2E-тест** запускать отдельно (`@pytest.mark.e2e`), так как требует полного Docker-окружения и долгий.
 6. **Маркеры pytest:**
    - `@pytest.mark.unit` — без зависимостей
