@@ -97,22 +97,28 @@ class ParsedDocument(BaseModel):
 
 **Поля:**
 - `markdown` — полный текст из `MarkdownOutput.markdown`
-- `title` — первый заголовок первого уровня в markdown
-- `abstract` — содержимое секции с заголовком, содержащим "abstract" / "аннотация" / "реферат" (регистронезависимо)
-- `authors` — извлекаются эвристически: строки между title и abstract, похожие на «И. О. Фамилия»
-- `year` — год в диапазоне 1900–2099, найденный в первом абзаце или заголовке
+- `title` — первый заголовок первого уровня (`# ...`), если нет — первый `**bold**`, иначе первая непустая строка
+- `abstract` — содержимое секции с заголовком, содержащим "abstract" / "аннотация" / "реферат" (регистронезависимо). Если секции нет — `""`
+- `authors` — простейшая эвристика: текст между title и первым `##`, разбивка по `,` и `;`. При неудаче — `[]`. TODO: извлекать через LLM в Stage 3
+- `year` — год в диапазоне 1900–2099, поиск в первых 2000 символах markdown
 - `doi` — DOI в тексте (regex: `10.\d{4,}/[^\s]+`)
 - `sections` — список секций с заголовками и содержимым
 
-### 1.2 `ParseError`
+### 1.2 Иерархия ошибок
 
 ```python
-class ParseError(Exception):
+class IngestionError(Exception):
+    """Базовая ошибка ingestion-пайплайна."""
+    pass
+
+class ParseError(IngestionError):
     """Ошибка парсинга PDF."""
     def __init__(self, message: str, original_error: Exception | None = None):
         super().__init__(message)
         self.original_error = original_error
 ```
+
+`IngestionError` — общий базовый класс для будущих `ChunkingError`, `EmbeddingError` и т.д.
 
 ---
 
@@ -172,28 +178,27 @@ parse_pdf(path)
 
 #### `_extract_sections(markdown: str) -> list[Section]`
 - Ищет строки, начинающиеся с `#` (заголовки markdown)
-- Группирует текст между заголовками одного уровня
-- Различает уровни по количеству `#`
-- Первая секция до первого заголовка — `""` (title area), игнорируется или помещается в начало первой секции
+- **Плоский список**: каждый элемент — заголовок любого уровня + текст до следующего заголовка любого уровня. Без вложенности
+- `level` = количество `#`, `start_line` = 0-based индекс строки в `markdown.split('\n')`
+- Текст до первого `##` пропускается (зона title/authors/аффилиаций, не секция)
 
 #### `_extract_title(markdown: str) -> str`
-- Первый заголовок первого уровня (`# ...`) в markdown
-- Если нет `#`, то первая непустая строка
-- Убирает символы `#` и пробелы
+- Приоритет: 1) первый `# Заголовок`, 2) первая строка `**...**` (bold), 3) первая непустая строка
+- Убирает символы `#`, `**` и обрамляющие пробелы
 
 #### `_extract_abstract(markdown: str, sections: list[Section]) -> str`
 - Ищет секцию, у которой `heading.lower()` содержит `"abstract"`, `"аннотация"`, `"реферат"`
 - Берёт `content` этой секции
-- Если секции нет — возвращает текст первого абзаца (первые 3–5 строк до первого заголовка)
-- Если текст пустой — `""`
+- Если секции нет — возвращает `""` (без fallback на первый абзац)
 
 #### `_extract_authors(markdown: str, title: str) -> list[str]`
-- Ищет строки между title и abstract / первым заголовком
-- Эвристика: строки, содержащие инициалы (паттерн: заглавная буква + точка + пробел + заглавная буква + точка)
-- Альтернативно: строки с запятыми, похожие на перечисление имён
+- Ищет строки между title и первым `##`
+- Простейшая эвристика: разбивка по `,` и `;`, очистка от пробелов
+- Если между title и первым `##` нет текста или разбивка не дала результатов — `[]`
+- TODO: извлекать авторов через LLM на Stage 3
 
 #### `_extract_year(markdown: str) -> int | None`
-- Поиск в первых 500 символах четырёхзначного числа 19xx или 20xx
+- Поиск в первых 2000 символах четырёхзначного числа 19xx или 20xx
 - Первое вхождение
 
 #### `_extract_doi(markdown: str) -> str | None`
@@ -208,7 +213,7 @@ parse_pdf(path)
 | Файл пустой (0 байт) | `ParseError("PDF file is empty")` |
 | marker выбросил исключение при парсинге | `ParseError("Failed to parse PDF: {reason}", original_error=e)` |
 | marker не выбросил исключение, но markdown пустой (менее 10 символов) | Не ошибка — возвращаем ParsedDocument с пустыми полями |
-| Таймаут парсинга (>300 сек) | `ParseError("PDF parsing timed out")` |
+| Таймаут парсинга | Не реализуется в парсере — зона ответственности вызывающего кода (pipeline через `asyncio.wait_for` + `run_in_executor`) |
 
 ### 2.5 Зависимости и импорты
 
@@ -291,7 +296,7 @@ def _get_models() -> dict:
 
 ### 5.2 Тестовые markdown-фикстуры
 
-Создать `tests/unit/fixtures/markdown_samples.py`:
+Создать `tests/fixtures/markdown_samples.py` (общие фикстуры, не только для unit-тестов):
 
 ```python
 SAMPLE_MARKDOWN_RUSSIAN = """\
@@ -367,18 +372,16 @@ Year: 2023
 
 ### 6.1 Класс `TestMarkerParserIntegration`
 
-**Требуется:** реальный marker (тяжёлый, с загрузкой моделей). Пометить `@pytest.mark.slow` и `@pytest.mark.integration`.
-
-**Использует:** PDF-файлы из `in_pdfs/`.
+**Подход:** вместо запуска реального marker'а (тяжёлые модели, 2–4 ГБ, >120с на прогрев), используем **snapshot'ы** — сохранённый markdown-вывод marker'а для PDF из `in_pdfs/`. Snapshot'ы лежат в `tests/fixtures/marker_snapshots/`.
 
 **Тесты:**
 
 | # | Тест | Описание |
 |---|------|----------|
-| 1 | `test_parse_real_scientific_pdf` | Реальный научный PDF → ParsedDocument с markdown длиной > 200 |
-| 2 | `test_parse_all_test_pdfs` | Все PDF из `in_pdfs/` парсятся без ошибок |
-| 3 | `test_real_pdf_has_title` | У реального PDF извлекается title |
-| 4 | `test_real_pdf_has_sections` | У реального PDF ≥ 1 секции |
+| 1 | `test_parse_with_masagutov_snapshot` | Snapshot Masagutov → ParsedDocument с секциями, title |
+| 2 | `test_parse_with_vyalov_snapshot` | Snapshot Vyalov → ParsedDocument с секциями, title |
+| 3 | `test_snapshot_has_sections` | Каждый snapshot даёт ≥ 1 секции |
+| 4 | `test_snapshot_has_title` | Каждый snapshot даёт непустой title |
 
 ---
 
@@ -388,23 +391,28 @@ Year: 2023
 app/
 ├── ingestion/
 │   ├── __init__.py           # было: пустой docstring
-│   └── parser.py             # НОВЫЙ: parse_pdf(), ParsedDocument, Section, ParseError
+│   └── parser.py             # НОВЫЙ: parse_pdf(), ParsedDocument, Section, IngestionError, ParseError
 │
 ├── models/
 │   └── schemas.py            # БЕЗ ИЗМЕНЕНИЙ (не добавляем ParsedDocument сюда)
 │                             # ParsedDocument — внутренняя модель ingestion, не API-модель
 
 tests/
+├── fixtures/                  # НОВЫЙ: общие фикстуры
+│   ├── __init__.py
+│   ├── markdown_samples.py   # НОВЫЙ: синтетические markdown-строки для юнит-тестов
+│   └── marker_snapshots/      # НОВЫЙ: snapshot'ы реального вывода marker'а
+│       ├── masagutov.md
+│       └── vyalov.md
+│
 ├── unit/
 │   ├── __init__.py
-│   ├── test_stage2_parser.py  # НОВЫЙ: юнит-тесты парсера с моком marker
-│   └── fixtures/
-│       └── markdown_samples.py  # НОВЫЙ: фикстуры markdown-текстов
+│   └── test_stage2_parser.py  # НОВЫЙ: юнит-тесты парсера с моком marker
 │
 ├── integration/
 │   ├── __init__.py
 │   ├── test_stage1_infra.py   # существующий
-│   └── test_stage2_parser_real.py  # НОВЫЙ: интеграционные тесты на реальных PDF
+│   └── test_stage2_parser_real.py  # НОВЫЙ: тесты на snapshot'ах marker'а
 
 in_pdfs/
 ├── 01_Masagutov_s.pdf         # существующий (уже есть)
@@ -415,11 +423,11 @@ in_pdfs/
 
 ## Задача 8: Порядок выполнения (checklist)
 
-- [ ] 8.1 Создать `tests/unit/fixtures/` и `markdown_samples.py` с тестовыми markdown-строками
+- [ ] 8.1 Создать `tests/fixtures/` (общие) — `__init__.py`, `markdown_samples.py`, `marker_snapshots/`
 - [ ] 8.2 Создать `tests/unit/test_stage2_parser.py` — сначала тесты (TDD)
 - [ ] 8.3 Реализовать `app/ingestion/parser.py`:
   - [ ] 8.3.1 Класс `Section` и `ParsedDocument`
-  - [ ] 8.3.2 `ParseError`
+  - [ ] 8.3.2 `IngestionError` и `ParseError`
   - [ ] 8.3.3 `_get_models()` с `@lru_cache`
   - [ ] 8.3.4 `_create_converter()` — создание PdfConverter
   - [ ] 8.3.5 `_extract_sections()` — извлечение секций по markdown-заголовкам
@@ -430,9 +438,9 @@ in_pdfs/
   - [ ] 8.3.10 `_extract_doi()` — извлечение DOI
   - [ ] 8.3.11 `parse_pdf()` — главная функция, собирающая всё вместе
 - [ ] 8.4 Запустить юнит-тесты, убедиться что проходят
-- [ ] 8.5 Создать `tests/integration/test_stage2_parser_real.py`
-- [ ] 8.6 Запустить интеграционные тесты (требуется Docker или локальный marker)
-- [ ] 8.7 Убедиться, что `parse_pdf()` работает на PDF из `in_pdfs/`
+- [ ] 8.5 Создать `tests/integration/test_stage2_parser_real.py` (на snapshot'ах)
+- [ ] 8.6 Один раз прогнать marker на PDF из `in_pdfs/`, сохранить вывод в `tests/fixtures/marker_snapshots/`
+- [ ] 8.7 Запустить интеграционные тесты на snapshot'ах
 
 ---
 
